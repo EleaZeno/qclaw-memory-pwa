@@ -78,6 +78,16 @@
   <pre id="viewer" class="hidden"></pre>
 </div>
 
+<!-- Step 5: authorize a NEW device (laptop-free recovery) -->
+<div class="card hidden" id="card-grant">
+  <div style="font-weight:600;margin-bottom:6px;">⑤ 授权新设备（换机恢复）</div>
+  <div class="sub">新电脑跑 <code>node mem-sync.mjs recover-request</code> 会吐出一段恢复请求。把它粘到下面，刷脸即可生成授权令牌——这台手机直接把密钥封给新设备，全程不经过明文。</div>
+  <textarea id="grant-req" placeholder="粘贴新设备的恢复请求 JSON（qclaw.recover-request.v1）" style="width:100%;height:90px;margin-top:8px;background:#0f0f17;color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:10px;font-size:12px;"></textarea>
+  <button id="btn-grant">🪪 Face ID 授权这台新设备</button>
+  <div class="status" id="grant-status"></div>
+  <textarea id="grant-out" class="hidden" readonly style="width:100%;height:110px;margin-top:8px;background:#0f0f17;color:var(--ok);border:1px solid var(--line);border-radius:10px;padding:10px;font-size:12px;"></textarea>
+</div>
+
 <script type="module" src="app.js"></script>
 </body>
 </html>
