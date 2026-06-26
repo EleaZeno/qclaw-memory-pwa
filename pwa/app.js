@@ -64,6 +64,63 @@ async function unwrapDEK(devPrivRaw, wrap){
   return aesGcmDecrypt(new Uint8Array(wrapKeyBits), wrap);
 }
 
+// AES-GCM encrypt (match Node: returns {iv,ct,tag} with tag split off the WebCrypto blob)
+async function aesGcmEncrypt(keyBytes, plain, aad){
+  const key = await subtle.importKey('raw', keyBytes, {name:'AES-GCM'}, false, ['encrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const params = {name:'AES-GCM', iv};
+  if(aad) params.additionalData = aad;
+  const combined = new Uint8Array(await subtle.encrypt(params, key, plain)); // ct||tag(16)
+  const ct = combined.slice(0, combined.length-16);
+  const tag = combined.slice(combined.length-16);
+  return { iv:b64(iv), ct:b64(ct), tag:b64(tag) };
+}
+
+// ECIES seal: wrap a DEK to a recipient X25519 public key (SPKI DER, b64). Mirrors Node sealToRecipient.
+async function sealToRecipient(recipientPubDerB64, dek){
+  const recipRaw = spkiToRaw(unb64(recipientPubDerB64));
+  const recipPub = await subtle.importKey('raw', recipRaw, {name:'X25519'}, false, []);
+  const eph = await subtle.generateKey({name:'X25519'}, true, ['deriveBits']);
+  const shared = new Uint8Array(await subtle.deriveBits({name:'X25519', public:recipPub}, eph.privateKey, 256));
+  const ephPubRaw = new Uint8Array(await subtle.exportKey('raw', eph.publicKey));
+  const ephPubDer = rawToSpki(ephPubRaw);
+  const hk = await subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+  const wrapKeyBits = await subtle.deriveBits(
+    {name:'HKDF', hash:'SHA-256', salt:ephPubDer, info:enc.encode('qclaw-mem-wrap-v2')}, hk, 256);
+  const wrapped = await aesGcmEncrypt(new Uint8Array(wrapKeyBits), dek);
+  return { ephPub:b64(ephPubDer), ...wrapped };
+}
+
+async function deviceIdFromPubDer(pubDerB64){
+  const idBuf = new Uint8Array(await subtle.digest('SHA-256', enc.encode(pubDerB64)));
+  return [...idBuf].map(x=>x.toString(16).padStart(2,'0')).join('').slice(0,16);
+}
+
+// Find OUR enrolled wrap in the keyring and recover the DEK with the unlocked device priv.
+async function recoverDEK(){
+  const keyring = await ghGetJson('keyring.json');
+  if(!keyring) throw new Error('仓库缺 keyring.json');
+  for(const id of Object.keys(keyring.wraps)){
+    try{ return await unwrapDEK(SESSION.devPriv, keyring.wraps[id]); }catch(e){}
+  }
+  throw new Error('本机私钥解不开任何 keyring 信封（未授权？）');
+}
+
+// APPROVE a new device: take its recover-request, seal the DEK to its pubkey, emit grant.
+async function grantNewDevice(reqJson){
+  let req; try{ req = JSON.parse(reqJson.trim()); }catch{ throw new Error('恢复请求不是合法 JSON'); }
+  if(req.kind!=='qclaw.recover-request.v1' || !req.pubDer || !req.id) throw new Error('不是 recover-request.v1 令牌');
+  if(await deviceIdFromPubDer(req.pubDer)!==req.id) throw new Error('请求 id 与公钥不符（可能被篡改）');
+  if(!SESSION.devPriv) throw new Error('请先 Face ID 解锁');
+  const dek = await recoverDEK();                      // iPhone recovers DEK
+  const wrap = await sealToRecipient(req.pubDer, dek);  // seal DEK to NEW device pubkey
+  // figure out our own device id (the approver), best-effort
+  let approver = localStorage.getItem('qclaw.devid') || null;
+  const grant = { kind:'qclaw.grant.v1', id:req.id, label:req.label||'recovered-device',
+                  pubDer:req.pubDer, wrap, approver, at:new Date().toISOString() };
+  return JSON.stringify(grant);
+}
+
 // ---------- WebAuthn (Face ID) with PRF ----------
 async function enrollPasskey(){
   const userId = crypto.getRandomValues(new Uint8Array(16));
@@ -113,6 +170,7 @@ async function genDeviceKeypair(){
   // device id = first 16 hex of sha256(pubDer base64) to match Node engine
   const idBuf = new Uint8Array(await subtle.digest('SHA-256', enc.encode(b64(pubDer))));
   const id = [...idBuf].map(x=>x.toString(16).padStart(2,'0')).join('').slice(0,16);
+  localStorage.setItem('qclaw.devid', id);
   return { id, label:'iPhone', pubDer:b64(pubDer) };
 }
 
@@ -149,7 +207,7 @@ function refreshCards(){
   const hasDev = !!localStorage.getItem(LS.dev);
   $('card-bootstrap').classList.toggle('hidden', !localStorage.getItem(LS.cred) || hasDev);
   $('btn-enroll').classList.toggle('hidden', !!localStorage.getItem(LS.cred));
-  if(hasDev) $('card-mem').classList.remove('hidden');
+  if(hasDev){ $('card-mem').classList.remove('hidden'); if($('card-grant')) $('card-grant').classList.remove('hidden'); }
 }
 
 $('btn-save-token').onclick = ()=>{
@@ -174,7 +232,7 @@ $('btn-gen').onclick = async ()=>{
 $('btn-unlock').onclick = async ()=>{
   try{ if(!localStorage.getItem(LS.dev)){setStatus('auth-status','请先绑定设备密钥(③)','err');return;}
     setStatus('auth-status','Face ID 解锁中…'); await unlockDevice();
-    setStatus('auth-status','✅ 已解锁','ok'); $('card-mem').classList.remove('hidden');
+    setStatus('auth-status','✅ 已解锁','ok'); $('card-mem').classList.remove('hidden'); if($('card-grant')) $('card-grant').classList.remove('hidden');
   }catch(e){ setStatus('auth-status','❌ '+e.message,'err'); }
 };
 $('btn-pull').onclick = async ()=>{
@@ -190,6 +248,19 @@ $('btn-pull').onclick = async ()=>{
 };
 $('btn-lock').onclick = ()=>{ SESSION.devPriv=null; $('filelist').innerHTML=''; $('viewer').classList.add('hidden');
   setStatus('mem-status','已锁定'); };
+
+// ---------- authorize a NEW device (laptop-free recovery) ----------
+if($('btn-grant')) $('btn-grant').onclick = async ()=>{
+  try{
+    if(!SESSION.devPriv){ setStatus('grant-status','请先 Face ID 解锁(②)','err'); return; }
+    const reqJson = $('grant-req').value;
+    if(!reqJson.trim()){ setStatus('grant-status','请粘贴新设备的恢复请求','err'); return; }
+    setStatus('grant-status','刷脸授权中…');
+    const token = await grantNewDevice(reqJson);
+    $('grant-out').value = token; $('grant-out').classList.remove('hidden');
+    setStatus('grant-status','✅ 已生成授权令牌。把上面整段回传给新设备/助手运行 ingest-grant','ok');
+  }catch(e){ setStatus('grant-status','❌ '+e.message,'err'); }
+};
 
 // boot
 if(localStorage.getItem(LS.token)) $('ghtoken').placeholder='已保存（重输可覆盖）';
